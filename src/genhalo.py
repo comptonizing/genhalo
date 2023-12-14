@@ -197,3 +197,6 @@ class Halo:
         hdu = fits.PrimaryHDU(cv.split(self.img))
         hdul = fits.HDUList([hdu])
         hdul.writeto(fname, overwrite=True)
+
+    def add(self, other):
+        self.__img = np.add(self.img, other)
