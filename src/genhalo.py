@@ -1,36 +1,400 @@
 import math
+import traceback
 import numpy as np
 import numbers
 import cv2 as cv
+import matplotlib.pyplot as plt
+import lmfit
+from lmfit.lineshapes import gaussian2d, lorentzian
+from scipy.ndimage import gaussian_filter
+from auto_stretch import stretch as AutoStretch
 from descriptors import cachedproperty
-from astropy.stats import sigma_clipped_stats
-from photutils.detection import DAOStarFinder
 from astropy.io import fits
+from astropy.stats import sigma_clipped_stats
+from photutils.detection import DAOStarFinder, IRAFStarFinder
+from photutils.detection import find_peaks
+from astropy.visualization import SqrtStretch
+from astropy.visualization.mpl_normalize import ImageNormalize
+from photutils.aperture import CircularAperture
 
 class Image:
-    def __init__(self, img,
-            detectionSigma = 3.0,
-            detectionFwhm = 3.0,
-            detectionThresholdFactor = 5.0
-            ):
-        self.__img = img.copy()
-        self.__sigma = detectionSigma
-        self.__fwhm = detectionSigma
-        self.__thresholdFactor = detectionThresholdFactor
+    def __init__(self, img, sigma = 3.0):
+        if len(img.shape) !=2 and len(img.shape) != 3:
+            raise ValueError("Unknown image dimensions")
 
-    @cachedproperty
+        self.__origImg = img.copy()
+        self.__stretchedOrigImg = None
+        self.__origLum = None
+        self.__stretchedOrigLum = None
+
+        self.__img = None
+        self.__stretchedImg = None
+        self.__updateStretchedImg = True
+        self.__lum = None
+        self.__updateLum = True
+        self.__stretchedLum = None
+        self.__updateStretchedLum = True
+
+        if len(img.shape) == 3:
+            if img.shape[0] != 1 and img.shape[0] != 3:
+                raise ValueError("Third image dimension must have length 1 or 3")
+
+        self.__sigma = sigma
+        self.__finderOptions = dict()
+
+        self.__stats = None
+        self.__updateStats = True
+        self.__lumStats = None
+        self.__updateLumStats = True
+        self.__origStats = None
+        self.__origLumStats = None
+
+    @property
+    def nx(self):
+        return self.img.shape[-2]
+    @property
+    def ny(self):
+        return self.img.shape[-1]
+
+    def __setUpdate(self):
+        self.__updateLum = True
+        self.__updateStats = True
+        self.__updateLumStats = True
+        self.__updateStretchedImg = True
+        self.__updateStretchedLum = True
+
+    @property
+    def stretchedOrigImg(self):
+        if self.__stretchedOrigImg is None:
+            stretch = AutoStretch.Stretch()
+            self.__stretchedOrigImg = stretch.stretch(self.origImg)
+        return self.__stretchedOrigImg
+
+    @property
+    def stretchedOrigLum(self):
+        if self.__stretchedOrigLum is None:
+            stretch = AutoStretch.Stretch()
+            self.__stretchedOrigLum = stretch.stretch(self.origLum)
+        return self.__stretchedOrigLum
+
+    @property
+    def stretchedImg(self):
+        if self.__updateStretchedImg or self.__stretchedImg is None:
+            stretch = AutoStretch.Stretch()
+            self.__stretchedImg = stretch.stretch(self.img)
+            self.__updateStretchedImg = False
+        return self.__stretchedImg
+
+    @property
+    def stretchedLum(self):
+        if self.__updateStretchedLum or self.__stretchedLum is None:
+            stretch = AutoStretch.Stretch()
+            self.__stretchedLum = stretch.stretch(self.lum)
+            self.__updateStretchedLum = False
+        return self.__stretchedLum
+
+
+    @property
+    def origImg(self):
+        return self.__origImg
+
+    @property
+    def origLum(self):
+        if self.__origLum is None:
+            if self.nChannels == 3:
+                self.__origLum = 1./3. * (self.__origImg[0] + self.__origImg[1] + self.__origImg[2])
+            else:
+                self.__origLum = self.__origImg # Reference
+        return self.__origLum
+
+    @property
+    def img(self):
+        if self.__img is None:
+            self.__img = self.__origImg.copy()
+        return self.__img
+
+    def __calcLum(self):
+        if self.nChannels == 3:
+            self.__lum = 1./3. * (self.img[0] + self.img[1] + self.img[2])
+        else:
+            self.__lum = self.img
+        self.__updateLum = False
+
+    @property
+    def lum(self):
+        if self.__updateLum or self.__lum is None:
+            self.__calcLum()
+        return self.__lum
+
+    def __calcOrigLumStats(self):
+        mean, median, std = sigma_clipped_stats(self.origLum, sigma=self.__sigma)
+        self.__origLumStats = {
+                'mean': mean,
+                'median': median,
+                'std': std
+                }
+
+    @property
+    def origLumStats(self):
+        if self.__origLumStats is None:
+            self.__calcOrigStats()
+        return self.__origLumStats
+
+    def __calcOrigStats(self):
+        if self.nChannels == 2:
+            self.__origStats = self.origLumStats
+            return
+        self.__origStats = {
+                'mean': np.empty(self.nChannels),
+                'median': np.empty(self.nChannels),
+                'std': np.empty(self.nChannels)
+                }
+        for ichannel in range(self.nChannels):
+            mean, median, std = sigma_clipped_stats(self.origImg[ichannel], sigma=self.__sigma)
+            self.__origStats['mean'] = mean
+            self.__origStats['median'] = median
+            self.__origStats['std'] = std
+
+    @property
+    def origStats(self):
+        if self.__origStats is None:
+            self.__calcOrigStats()
+        return self.__origStats
+
+    def __calcLumStats(self):
+        mean, median, std = sigma_clipped_stats(self.lum, sigma=self.__sigma)
+        self.__lumStats = {
+                'mean': mean,
+                'median': median,
+                'std': std
+                }
+
+    @property
+    def lumStats(self):
+        if self.__updateLumStats:
+            self.__calcLumStats()
+            self.__updateLumStats = False
+        return self.__lumStats
+
+    def __calcStats(self):
+        if self.nChannels == 2:
+            self.__stats = self.lumStats
+            return
+        self.__stats = {
+                'mean': np.empty(self.nChannels),
+                'median': np.empty(self.nChannels),
+                'std': np.empty(self.nChannels)
+                }
+        for ichannel in range(self.nChannels):
+            mean, median, std = sigma_clipped_stats(self.img[ichannel], sigma=self.__sigma)
+            self.__stats['mean'] = mean
+            self.__stats['median'] = median
+            self.__stats['std'] = std
+
+    @property
     def stats(self):
-        mean, median, std = sigma_clipped_stats(self.__img, sigma=self.__sigma)
-        return dict(mean=mean, median=median, std=std)
+        if self.__updateStats:
+            self.__calcStats()
+            self.__updateStats = False
+        return self.__stats
 
-    @cachedproperty
+    @property
+    def nChannels(self):
+        if len(self.__origImg.shape) == 2:
+            return 1
+        else:
+            return self.__origImg.shape[0]
+
     def stars(self):
-        daofind = DAOStarFinder(fwhm=self.__fwhm, threshold=self.__thresholdFactor * self.stats['std'])
-        return daofind(self.__img - self.stats['median'])
+        if not 'fwhm' in self.__finderOptions:
+            self.__finderOptions['fwhm'] = 3.0
+        if not 'threshold' in self.__finderOptions:
+            self.__finderOptions['threshold'] = 20.0 * self.stats['std']
+        daofind = DAOStarFinder(**self.__finderOptions)
+        return daofind(self.lum - self.lumStats["median"])
+
+    def showStars(self):
+        stars = self.stars()
+        positions = np.transpose((stars['xcentroid'], stars['ycentroid']))
+        apertures = CircularAperture(positions, r=4.0)
+        self.__plotImg(stretch=True)
+        apertures.plot(color='blue', lw=1.5, alpha=0.5)
+        plt.show()
+
+    def peaks(self, threshold, box_size=31, blurSigma=10):
+        img = gaussian_filter(self.lum, blurSigma)
+        return find_peaks(img, threshold, box_size=box_size)
+
+    def showPeaks(self, threshold, box_size=31, blurSigma=10, stretch=True):
+        peaks = self.peaks(threshold, box_size=box_size, blurSigma=blurSigma)
+        self.__plotImg(stretch=stretch)
+        if peaks is not None:
+            apertures = CircularAperture(np.transpose((peaks['x_peak'], peaks['y_peak'])), r=6.0)
+            apertures.plot(color='blue', lw=1.5, alpha=0.5)
+        plt.show()
+
+    def findOverexposedStars(self, limit=0.95):
+        peaks = self.peaks(0.01)
+        xin = peaks["x_peak"]
+        yin = peaks["y_peak"]
+        x = [int(round(bla)) for bla in xin]
+        y = [int(round(bla)) for bla in yin]
+        outx = []
+        outy = []
+        for ii in range(len(x)):
+            if self.lum[y[ii], x[ii]] >= limit:
+                outx.append(xin[ii])
+                outy.append(yin[ii])
+        return outx, outy
+
+    @property
+    def shape(self):
+        return self.img.shape
+
+    def addHalo(self, halo):
+        if not isinstance(halo, Halo):
+            raise ValueError("halo needs to be of type Halo")
+        self.__img = np.add(self.img, halo.img)
+        self.__setUpdate()
+
 
     @property
     def data(self):
-        return self.__img
+        return self.img
+
+    def setFinderOptions(self, options):
+        self.__finderOptions = options
+
+    def __plotImg(self, stretch=False):
+        if stretch:
+            img = self.stretchedImg
+        else:
+            img = self.img
+        if len(img.shape) == 3:
+            img = np.dstack([img[0], img[1], img[2]])
+        plt.imshow(img, origin='lower', interpolation='nearest')
+
+    def showOverexposedStars(self, stretch=False):
+        self.__plotImg(stretch=stretch)
+        x, y = self.findOverexposedStars()
+        for ii in range(len(x)):
+            r = self.starExtent(x[ii], y[ii])
+            aperture = CircularAperture((x[ii], y[ii]), r=r)
+            aperture.plot(color='blue', lw=1.5, alpha=0.5)
+        plt.show()
+
+    def showImage(self, stretch=True):
+        self.__plotImg(stretch=stretch)
+        plt.show()
+
+    def starExtent(self, x0, y0, limit=0.95):
+        if self.nChannels == 1:
+            radii = np.zeros(1)
+            img = [self.lum]
+        else:
+            radii = np.zeros(3)
+            img = self.img
+        center = [int(round(x0)), int(round(y0))]
+
+        for ichannel in range(len(img)):
+            val = 1
+            r = 0
+            mask = np.empty([self.nx, self.ny], dtype=np.float32)
+            while val >= limit:
+                r += 1
+                mask.fill(0)
+                cv.circle(mask, center, r, 1, 1)
+                ind = np.where(mask == 1)
+                val = np.max(img[ichannel][ind])
+            radii[ichannel] = r
+        return np.max(radii)
+
+    def fitStar(self, x0, y0, radius=10):
+        if self.nChannels == 1:
+            imgs = [self.img]
+        else:
+            imgs = self.img
+        xcenter = radius
+        xstart = x0 - radius
+        xstop = x0 + radius
+        ycenter = radius
+        ystart = y0 - radius
+        ystop = y0 + radius
+
+        if xstop >= self.nx:
+            if (xstop - self.nx) == (radius - 1):
+                xcenter -= 1
+                x0 -= 1
+            xstop = self.nx - 1
+        if ystop >= self.ny:
+            if (ystop - self.ny) == (radius - 1):
+                ycenter -= 1
+                y0 -= 1
+            ystop = self.ny - 1
+        if xstart < 0:
+            xcenter = xstart + radius
+            xstart = 0
+        if ystart < 0:
+            ycenter = ystart + radius
+            ystart = 0
+        
+        x = np.arange(xstart, xstop, dtype=np.float32)
+        y = np.arange(ystart, ystop, dtype=np.float32)
+        y, x = np.meshgrid(y, x)
+        x = x.flatten()
+        y = y.flatten()
+
+        results = []
+        for ichannel in range(self.nChannels):
+            inset = imgs[ichannel][xstart:xstop,ystart:ystop]
+            z = inset.flatten()
+            model = lmfit.models.Gaussian2dModel()
+            params = model.make_params(
+                    amplitude = 1100.,
+                    centerx = x0,
+                    centery = y0,
+                    sigmax = 1.0,
+                    sigmay = 1.0
+                    )
+            results.append(model.fit(z, x=x, y=y, params=params))
+        return results
+            #plt.title(result.redchi)
+            #plt.axis([result.best_values["centery"]-radius, result.best_values["centery"]+radius,
+            #    result.best_values["centerx"]-radius,result.best_values["centerx"]+radius])
+            #self.__plotImg(stretch=True)
+            #aperture = CircularAperture([result.best_values["centery"], result.best_values["centerx"]], r=3.0)
+            #aperture.plot(color='blue', lw=1.5, alpha=0.5)
+            #plt.plot([
+            #        result.best_values["centery"]-2.35482*result.best_values["sigmay"],
+            #        result.best_values["centery"]+2.35482*result.best_values["sigmay"]
+            #    ],[
+            #        result.best_values["centerx"],
+            #        result.best_values["centerx"]
+            #    ], color="green")
+            #plt.plot([
+            #        result.best_values["centery"],
+            #        result.best_values["centery"]
+            #    ],[
+            #        result.best_values["centerx"]-2.35482*result.best_values["sigmax"],
+            #        result.best_values["centerx"]+2.35482*result.best_values["sigmax"]
+            #    ],color="green")
+            #plt.show(block=True)
+            #plt.pause(0.1)
+            #plt.cla()
+
+    def FWHMs(self):
+        stars = self.stars()
+        fwhms = np.empty([len(stars['xcentroid']), self.nChannels])
+        fwhms.fill(np.nan)
+        for ii in range(len(stars['xcentroid'])):
+            results = self.fitStar(int(round(stars['ycentroid'][ii])), int(round(stars['xcentroid'][ii])))
+            for ichannel in range(self.nChannels):
+                fwhms[ii,ichannel] = 0.5 * 2.3548 * (
+                        results[ichannel].best_values['sigmax'] +
+                        results[ichannel].best_values['sigmay']
+                            )
+        return fwhms
+
 
 class Star:
     pass
