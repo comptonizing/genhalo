@@ -49,6 +49,8 @@ class Image:
         self.__origStats = None
         self.__origLumStats = None
 
+        self.__stars = None
+
     @property
     def nx(self):
         return self.img.shape[-2]
@@ -206,16 +208,37 @@ class Image:
             return self.__origImg.shape[0]
 
     def stars(self):
+        if self.__stars is not None:
+            return self.__stars
+
         if not 'fwhm' in self.__finderOptions:
             self.__finderOptions['fwhm'] = 3.0
         if not 'threshold' in self.__finderOptions:
             self.__finderOptions['threshold'] = 20.0 * self.stats['std']
         daofind = DAOStarFinder(**self.__finderOptions)
-        return daofind(self.lum - self.lumStats["median"])
+        res = daofind(self.lum - self.lumStats["median"])
+        self.__stars = []
+
+        if self.nChannels == 1:
+            imgs = [self.img]
+        else:
+            imgs = self.img
+
+        for ii in range(len(res['xcentroid'])):
+            self.__stars.append(Star(imgs, int(round(res['ycentroid'][ii])), int(round(res['xcentroid'][ii]))))
+
+        return self.__stars
+
+    @property
+    def starsx0(self):
+        return np.array([thing.x0 for thing in self.stars()])
+
+    @property
+    def starsy0(self):
+        return np.array([thing.y0 for thing in self.stars()])
 
     def showStars(self):
-        stars = self.stars()
-        positions = np.transpose((stars['xcentroid'], stars['ycentroid']))
+        positions = np.transpose((self.starsy0, self.starsx0))
         apertures = CircularAperture(positions, r=4.0)
         self.__plotImg(stretch=True)
         apertures.plot(color='blue', lw=1.5, alpha=0.5)
@@ -272,6 +295,7 @@ class Image:
             img = self.img
         if len(img.shape) == 3:
             img = np.dstack([img[0], img[1], img[2]])
+        print(img.shape)
         plt.imshow(img, origin='lower', interpolation='nearest')
 
     def showOverexposedStars(self, stretch=False):
@@ -309,11 +333,47 @@ class Image:
             radii[ichannel] = r
         return np.max(radii)
 
-    def fitStar(self, x0, y0, radius=10):
-        if self.nChannels == 1:
-            imgs = [self.img]
-        else:
-            imgs = self.img
+
+    def FWHMs(self, maxredchi=0.0003, maxfwhm=15, ratiospread=1.5, maxratio=1.5):
+        stars = self.stars()
+        fwhms = []
+        for ii in range(len(stars)):
+            results = self.stars()[ii].params
+            maxchi = np.max([results[bla].summary()["redchi"] for bla in range(self.nChannels)])
+            those = np.array([[results[bla].best_values['sigmax'], results[bla].best_values['sigmay']] for bla in range(self.nChannels)]).flatten()
+            ratios = np.array([those[x] / those[x+1] for x in range(0,self.nChannels*2,2)])
+            if max(ratios) > maxratio:
+                continue
+            if max(ratios) / min(ratios) > ratiospread:
+                continue
+            foundnan = False
+            for bla in those:
+                if np.isnan(bla):
+                    foundnan = True
+            if foundnan:
+                continue
+            if np.min(those) > maxfwhm:
+                continue
+            if maxchi > maxredchi:
+                continue
+            fwhms.append([])
+            for ichannel in range(self.nChannels):
+                fwhms[-1].append(0.5 * 2.3548 * (
+                        results[ichannel].best_values['sigmax'] +
+                        results[ichannel].best_values['sigmay']
+                            ) )
+        return np.array(fwhms)
+
+    @property
+    def FWHM(self):
+        return np.median(self.FWHMs())
+
+class Star:
+    def __init__(self, img, x0, y0, radius=6):
+        self.__radius = radius
+        self.__x0 = x0
+        self.__y0 = y0
+
         xcenter = radius
         xstart = x0 - radius
         xstop = x0 + radius
@@ -321,83 +381,109 @@ class Image:
         ystart = y0 - radius
         ystop = y0 + radius
 
-        if xstop >= self.nx:
-            if (xstop - self.nx) == (radius - 1):
+        nx = img[0].shape[-2]
+        ny = img[0].shape[-1]
+
+        if xstop >= nx:
+            if (xstop - nx) == (radius - 1):
                 xcenter -= 1
                 x0 -= 1
-            xstop = self.nx - 1
-        if ystop >= self.ny:
-            if (ystop - self.ny) == (radius - 1):
+            xstop = nx - 1
+        if ystop >= ny:
+            if (ystop - ny) == (radius - 1):
                 ycenter -= 1
                 y0 -= 1
-            ystop = self.ny - 1
+            ystop = ny - 1
         if xstart < 0:
             xcenter = xstart + radius
             xstart = 0
         if ystart < 0:
             ycenter = ystart + radius
             ystart = 0
-        
+
         x = np.arange(xstart, xstop, dtype=np.float32)
         y = np.arange(ystart, ystop, dtype=np.float32)
         y, x = np.meshgrid(y, x)
         x = x.flatten()
         y = y.flatten()
 
-        results = []
-        for ichannel in range(self.nChannels):
-            inset = imgs[ichannel][xstart:xstop,ystart:ystop]
-            z = inset.flatten()
+        self.__xstart = xstart
+        self.__xstop = xstop
+        self.__xcenter = xcenter
+        self.__ystart = ystart
+        self.__ystop = ystop
+        self.__ycenter = ycenter
+        self.__x = x
+        self.__y = y
+        self.__insets = []
+        for ii in range(len(img)):
+            self.__insets.append(img[ii][xstart:xstop,ystart:ystop])
+
+        self.__results = None
+
+    @property
+    def x0(self):
+        return self.__x0
+
+    @property
+    def y0(self):
+        return self.__y0
+
+    def fit(self):
+        if self.__results is not None:
+            return self.__results
+        self.__results = []
+        for ichannel in range(len(self.__insets)):
+            z = self.__insets[0].flatten()
             model = lmfit.models.Gaussian2dModel()
             params = model.make_params(
                     amplitude = 1100.,
-                    centerx = x0,
-                    centery = y0,
+                    centerx = self.x0,
+                    centery = self.y0,
                     sigmax = 1.0,
                     sigmay = 1.0
                     )
-            results.append(model.fit(z, x=x, y=y, params=params))
-        return results
-            #plt.title(result.redchi)
-            #plt.axis([result.best_values["centery"]-radius, result.best_values["centery"]+radius,
-            #    result.best_values["centerx"]-radius,result.best_values["centerx"]+radius])
-            #self.__plotImg(stretch=True)
-            #aperture = CircularAperture([result.best_values["centery"], result.best_values["centerx"]], r=3.0)
-            #aperture.plot(color='blue', lw=1.5, alpha=0.5)
-            #plt.plot([
-            #        result.best_values["centery"]-2.35482*result.best_values["sigmay"],
-            #        result.best_values["centery"]+2.35482*result.best_values["sigmay"]
-            #    ],[
-            #        result.best_values["centerx"],
-            #        result.best_values["centerx"]
-            #    ], color="green")
-            #plt.plot([
-            #        result.best_values["centery"],
-            #        result.best_values["centery"]
-            #    ],[
-            #        result.best_values["centerx"]-2.35482*result.best_values["sigmax"],
-            #        result.best_values["centerx"]+2.35482*result.best_values["sigmax"]
-            #    ],color="green")
-            #plt.show(block=True)
-            #plt.pause(0.1)
-            #plt.cla()
+            self.__results.append(model.fit(z, x=self.__x, y=self.__y, params=params))
 
-    def FWHMs(self):
-        stars = self.stars()
-        fwhms = np.empty([len(stars['xcentroid']), self.nChannels])
-        fwhms.fill(np.nan)
-        for ii in range(len(stars['xcentroid'])):
-            results = self.fitStar(int(round(stars['ycentroid'][ii])), int(round(stars['xcentroid'][ii])))
-            for ichannel in range(self.nChannels):
-                fwhms[ii,ichannel] = 0.5 * 2.3548 * (
-                        results[ichannel].best_values['sigmax'] +
-                        results[ichannel].best_values['sigmay']
-                            )
-        return fwhms
+    def __plotImg(self, stretch=True):
+        img = np.dstack(self.__insets)
+        if stretch:
+            stretcher = AutoStretch.Stretch()
+            img = stretcher.stretch(img)
+        plt.imshow(img)
 
+    def show(self, stretch=True):
+        self.__plotImg(stretch=stretch)
+        plt.show(block=True)
 
-class Star:
-    pass
+    @property
+    def params(self):
+        if self.__results is None:
+            self.fit()
+        return self.__results
+
+    def showFit(self):
+        plt.title(" ".join(["".format(x.redchi) for x in self.params]))
+        #plt.axis([0, self.__ystop, self.__xstart, self.__xstop])
+        self.__plotImg(stretch=True)
+        colors = ["red", "orange", "blue"]
+        for ii in range(len(self.params)):
+            p = self.params[ii]
+            centerx = p.best_values['centerx'] - self.__xstart
+            centery = p.best_values['centery'] - self.__ystart
+            aperture = CircularAperture([centery, centerx], r=3.0)
+            aperture.plot(color=colors[ii], lw=1.5, alpha=0.5)
+            plt.plot([
+                    centery-2.35482*p.best_values["sigmay"],
+                    centery+2.35482*p.best_values["sigmay"]
+                ],[centerx, centerx], color="green")
+            plt.plot([centery, centery],[
+                    centerx-2.35482*p.best_values["sigmax"],
+                    centerx+2.35482*p.best_values["sigmax"]
+                ],color="green")
+        plt.show(block=True)
+        plt.pause(0.1)
+        plt.cla()
 
 def isarray(thing):
     return isinstance(thing, list) or isinstance(thing, np.ndarray)
@@ -405,15 +491,6 @@ def isarray(thing):
 def isnumber(thing):
     return isinstance(thing, numbers.Number)
 
-# Image dimensions
-# Inset position
-# Radius
-# Intensity (mono or rgb)
-# Blur
-# Number of vanes
-# Angle of vanes
-# Thickness of vanes
-# Shadow size
 class Halo:
 
     def __init__(self,
@@ -556,8 +633,6 @@ class Halo:
         return self.__img
 
     def save(self, fname):
-        print(np.min(self.img))
-        print(np.max(self.img))
         hdu = fits.PrimaryHDU(cv.split(self.img))
         hdul = fits.HDUList([hdu])
         hdul.writeto(fname, overwrite=True)
